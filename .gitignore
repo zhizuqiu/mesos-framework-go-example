@@ -8,5 +8,10 @@
 /WebRoot/WEB-INF/classes
 /.myeclipse/
 
-mesos-framework-go-example*
-vendor
+mesos-framework-go-example
+mesos-framework-go-example.exe
+routers/commentsRouter_*
+
+log
+lastupdate.tmp
+/dist/
