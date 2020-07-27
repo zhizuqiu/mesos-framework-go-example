@@ -129,7 +129,7 @@ func run(cfg config.Config) {
 		)
 		shouldReconnect = maybeReconnect(cfg)
 		disconnected    = time.Now()
-		handler         = buildEventHandler(state)
+		handler         = buildEventHandler(state, cfg)
 	)
 	for {
 		func() {
@@ -205,7 +205,7 @@ func eventLoop(state *internalState, decoder encoding.Decoder, h events.Handler)
 	return err
 }
 
-func buildEventHandler(state *internalState) events.Handler {
+func buildEventHandler(state *internalState, cfg config.Config) events.Handler {
 	return events.HandlerFuncs{
 		executor.Event_SUBSCRIBED: func(_ context.Context, e *executor.Event) error {
 			log.Println("SUBSCRIBED")
@@ -215,7 +215,7 @@ func buildEventHandler(state *internalState) events.Handler {
 			return nil
 		},
 		executor.Event_LAUNCH: func(_ context.Context, e *executor.Event) error {
-			launch(state, e.Launch.Task)
+			launch(cfg, state, e.Launch.Task)
 			return nil
 		},
 		executor.Event_KILL: func(_ context.Context, e *executor.Event) error {
@@ -271,19 +271,19 @@ func max64(first int64, args ...int64) int64 {
 	return first
 }
 
-var CPU_SHARES_PER_CPU = 1024
-var MIN_CPU_SHARES = 2
-var MIN_MEMORY = 4194304
+var CpuSharesPerCpu = 1024
+var MinCpuShares = 2
+var MinMemory = 4194304
 
-func dockerRun(task mesos.TaskInfo) *container.ContainerCreateCreatedBody {
+func dockerRun(cfg config.Config, task mesos.TaskInfo) *container.ContainerCreateCreatedBody {
 	ctx := context.Background()
-	// cli, err := client.NewClientWithOpts(client.WithHost("tcp://112.125.89.9:2376"))
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		log.Println(err)
 		return nil
 	}
 
+	// cpus
 	cpus := 0.0
 	for _, r := range task.Resources {
 		if cpu, ok := resources.CPUs(r); ok {
@@ -291,6 +291,7 @@ func dockerRun(task mesos.TaskInfo) *container.ContainerCreateCreatedBody {
 		}
 	}
 
+	// mem
 	memory := uint64(0)
 	for _, r := range task.Resources {
 		if m, ok := resources.Memory(r); ok {
@@ -298,20 +299,34 @@ func dockerRun(task mesos.TaskInfo) *container.ContainerCreateCreatedBody {
 		}
 	}
 
+	// env
+	env := make([]string, 0)
+	if task.Executor != nil && task.Executor.Command != nil && task.Executor.Command.Environment != nil {
+		for _, e := range task.Executor.Command.Environment.Variables {
+			env = append(env, e.Name+"="+*e.Value)
+		}
+	}
+
+	// Binds
+	binds := make([]string, 0)
+	binds = append(binds, cfg.Sandbox+":/mnt/mesos/sandbox")
+
 	resp, err := cli.ContainerCreate(
 		context.Background(),
 		&container.Config{
-			Image: task.Container.Docker.Image,
-			Tty:   true,
+			Image:        task.Container.Docker.Image,
+			AttachStdout: true,
+			AttachStderr: true,
+			Env:          env,
 		},
 		&container.HostConfig{
 			Resources: container.Resources{
 				// 1,048,576‬ = 1M 最小为4M = 4,194,304
-				Memory: max64(int64(1048576*memory), int64(MIN_MEMORY)),
+				Memory: max64(int64(1048576*memory), int64(MinMemory)),
 				// swap设定为Memory的2倍
-				MemorySwap: max64(int64(1048576*memory), int64(MIN_MEMORY)) * 2,
+				MemorySwap: max64(int64(1048576*memory), int64(MinMemory)) * 2,
 				// 1024的倍数，最小值为2
-				CPUShares: max64(int64(cpus*(float64(CPU_SHARES_PER_CPU))), int64(MIN_CPU_SHARES)),
+				CPUShares: max64(int64(cpus*(float64(CpuSharesPerCpu))), int64(MinCpuShares)),
 			},
 		},
 		nil,
@@ -350,13 +365,13 @@ func dockerInspect(id string) (*types.ContainerJSON, error) {
 	}
 }
 
-func launch(state *internalState, task mesos.TaskInfo) {
+func launch(cfg config.Config, state *internalState, task mesos.TaskInfo) {
 	state.unackedTasks[task.TaskID] = task
 
 	b, _ := json.Marshal(task)
 	log.Println(string(b))
 
-	resp := dockerRun(task)
+	resp := dockerRun(cfg, task)
 
 	i, _ := dockerInspect(resp.ID)
 	is := []*types.ContainerJSON{i}
@@ -419,7 +434,7 @@ func kill(state *internalState, taskId mesos.TaskID) {
 
 	// send FINISHED
 	status = newStatus(state, taskId)
-	status.State = mesos.TASK_FINISHED.Enum()
+	status.State = mesos.TASK_KILLED.Enum()
 	err := update(state, status)
 	if err != nil {
 		log.Printf("failed to send TASK_FINISHED for task %s: %+v", taskId.Value, err)
@@ -427,6 +442,8 @@ func kill(state *internalState, taskId mesos.TaskID) {
 		status.Message = protoString(err.Error())
 		state.failedTasks[taskId] = status
 	}
+
+	state.shouldQuit = true
 }
 
 // helper func to package strings up nicely for protobuf
