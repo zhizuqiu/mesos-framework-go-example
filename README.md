@@ -1,0 +1,1 @@
+ GO111MODULE=on GOPROXY=https://goproxy.io  GOOS=linux GOARCH=amd64 go build .

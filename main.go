@@ -6,16 +6,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/mesos/mesos-go/api/v1/lib/resources"
 	"io"
 	"log"
+	"mesos-framework-go-example/docker_executor"
+	"mesos-framework-go-example/tools"
 	"net/url"
 	"os"
 	"time"
 
-	"github.com/docker/docker/client"
 	"github.com/mesos/mesos-go/api/v1/lib"
 	"github.com/mesos/mesos-go/api/v1/lib/backoff"
 	"github.com/mesos/mesos-go/api/v1/lib/encoding"
@@ -37,14 +35,43 @@ const (
 var errMustAbort = errors.New("received abort signal from mesos, will attempt to re-subscribe")
 
 var (
-	h             bool
-	ContainerName string
+	h                   bool
+	ContainerName       string
+	Docker              string
+	DockerSocket        string
+	SandboxDirectory    string
+	MappedDirectory     string
+	StopTimeout         string
+	LauncherDir         string
+	TaskEnvironment     string
+	DefaultContainerDns string
+	CgroupsEnableCfs    string
 )
 
 func init() {
 	flag.BoolVar(&h, "h", false, "this help")
 
-	flag.StringVar(&ContainerName, "container", "", "container name")
+	flag.StringVar(&ContainerName, "container", "", "The name of the docker container to run.")
+	flag.StringVar(&Docker, "docker", "", "The path to the docker executable.")
+	flag.StringVar(&DockerSocket, "docker_socket", "", "Resource used by the agent and the executor to provide CLI access\n"+
+		"to the Docker daemon. On Unix, this is typically a path to a\n"+
+		"socket, such as '/var/run/docker.sock'. On Windows this must be a\n"+
+		"named pipe, such as '//./pipe/docker_engine'.")
+	flag.StringVar(&SandboxDirectory, "sandbox_directory", "", "The path to the container sandbox holding stdout and stderr files\n"+
+		"into which docker container logs will be redirected.")
+	flag.StringVar(&MappedDirectory, "mapped_directory", "", "The sandbox directory path that is mapped in the docker container.")
+	flag.StringVar(&StopTimeout, "stop_timeout", "", "The duration for docker to wait after stopping a running container\n"+
+		"before it kills that container. This flag is deprecated; use task's\n"+
+		"kill policy instead.")
+	flag.StringVar(&LauncherDir, "launcher_dir", "", "Directory path of Mesos binaries. Mesos would find fetcher,\n"+
+		"containerizer and executor binary files under this directory.")
+	flag.StringVar(&TaskEnvironment, "task_environment", "", "A JSON map of environment variables and values that should\n"+
+		"be passed into the task launched by this executor.")
+	flag.StringVar(&DefaultContainerDns, "default_container_dns", "", "JSON-formatted default DNS information for container.")
+	flag.StringVar(&CgroupsEnableCfs, "cgroups_enable_cfs", "", "Cgroups feature flag to enable hard limits on CPU resources\n"+
+		"via the CFS bandwidth limiting subfeature.\n")
+
+	flag.Usage = usage
 }
 
 func usage() {
@@ -60,6 +87,7 @@ func main() {
 
 	if h {
 		flag.Usage()
+		return
 	}
 
 	pid := os.Getpid()
@@ -262,190 +290,6 @@ func sendFailedTasks(state *internalState) {
 	}
 }
 
-func max64(first int64, args ...int64) int64 {
-	for _, v := range args {
-		if first < v {
-			first = v
-		}
-	}
-	return first
-}
-
-var CpuSharesPerCpu = 1024
-var MinCpuShares = 2
-var MinMemory = 4194304
-
-func dockerRun(cfg config.Config, task mesos.TaskInfo) *container.ContainerCreateCreatedBody {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	// cpus
-	cpus := 0.0
-	for _, r := range task.Resources {
-		if cpu, ok := resources.CPUs(r); ok {
-			cpus += cpu
-		}
-	}
-
-	// mem
-	memory := uint64(0)
-	for _, r := range task.Resources {
-		if m, ok := resources.Memory(r); ok {
-			memory += m
-		}
-	}
-
-	// env
-	env := make([]string, 0)
-	if task.Executor != nil && task.Executor.Command != nil && task.Executor.Command.Environment != nil {
-		for _, e := range task.Executor.Command.Environment.Variables {
-			env = append(env, e.Name+"="+*e.Value)
-		}
-	}
-
-	// Binds
-	binds := make([]string, 0)
-	binds = append(binds, cfg.Sandbox+":/mnt/mesos/sandbox")
-
-	resp, err := cli.ContainerCreate(
-		context.Background(),
-		&container.Config{
-			Image:        task.Container.Docker.Image,
-			AttachStdout: true,
-			AttachStderr: true,
-			Env:          env,
-		},
-		&container.HostConfig{
-			Resources: container.Resources{
-				// 1,048,576‬ = 1M 最小为4M = 4,194,304
-				Memory: max64(int64(1048576*memory), int64(MinMemory)),
-				// swap设定为Memory的2倍
-				MemorySwap: max64(int64(1048576*memory), int64(MinMemory)) * 2,
-				// 1024的倍数，最小值为2
-				CPUShares: max64(int64(cpus*(float64(CpuSharesPerCpu))), int64(MinCpuShares)),
-			},
-		},
-		nil,
-		ContainerName,
-	)
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	log.Println(resp.ID)
-
-	if err := cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		log.Println(err)
-		return nil
-	}
-	return &resp
-}
-
-func dockerInspect(id string) (*types.ContainerJSON, error) {
-	ctx := context.Background()
-	// cli, err := client.NewClientWithOpts(client.WithHost("tcp://112.125.89.9:2376"))
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Println(err)
-		return nil, err
-	}
-
-	for {
-		time.Sleep(500 * time.Millisecond)
-
-		c, err := cli.ContainerInspect(ctx, id)
-		if err == nil {
-			return &c, nil
-		}
-	}
-}
-
-func launch(cfg config.Config, state *internalState, task mesos.TaskInfo) {
-	state.unackedTasks[task.TaskID] = task
-
-	b, _ := json.Marshal(task)
-	log.Println(string(b))
-
-	resp := dockerRun(cfg, task)
-
-	i, _ := dockerInspect(resp.ID)
-	is := []*types.ContainerJSON{i}
-	ib, _ := json.Marshal(is)
-
-	// send RUNNING
-	status := newStatus(state, task.TaskID)
-	status.State = mesos.TASK_RUNNING.Enum()
-	status.Data = ib
-	err := update(state, status)
-	if err != nil {
-		log.Printf("failed to send TASK_RUNNING for task %s: %+v", task.TaskID.Value, err)
-		status.State = mesos.TASK_FAILED.Enum()
-		status.Message = protoString(err.Error())
-		state.failedTasks[task.TaskID] = status
-		return
-	}
-
-	/*
-		// send FINISHED
-		status = newStatus(state, task.TaskID)
-		status.State = mesos.TASK_FINISHED.Enum()
-		err = update(state, status)
-		if err != nil {
-			log.Printf("failed to send TASK_FINISHED for task %s: %+v", task.TaskID.Value, err)
-			status.State = mesos.TASK_FAILED.Enum()
-			status.Message = protoString(err.Error())
-			state.failedTasks[task.TaskID] = status
-		}
-	*/
-}
-
-func dockerKill() {
-	ctx := context.Background()
-	// cli, err := client.NewClientWithOpts(client.WithHost("tcp://112.125.89.9:2376"))
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	log.Println("docker kill " + ContainerName)
-
-	err = cli.ContainerKill(
-		ctx,
-		ContainerName,
-		"SIGKILL",
-	)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-}
-
-func kill(state *internalState, taskId mesos.TaskID) {
-
-	dockerKill()
-
-	status := newStatus(state, taskId)
-
-	// send FINISHED
-	status = newStatus(state, taskId)
-	status.State = mesos.TASK_KILLED.Enum()
-	err := update(state, status)
-	if err != nil {
-		log.Printf("failed to send TASK_FINISHED for task %s: %+v", taskId.Value, err)
-		status.State = mesos.TASK_FAILED.Enum()
-		status.Message = protoString(err.Error())
-		state.failedTasks[taskId] = status
-	}
-
-	state.shouldQuit = true
-}
-
 // helper func to package strings up nicely for protobuf
 // NOTE(jdef): if we need any more proto funcs like this, just import the
 // proto package and use those.
@@ -471,7 +315,7 @@ func newStatus(state *internalState, id mesos.TaskID) mesos.TaskStatus {
 		TaskID:     id,
 		Source:     mesos.SOURCE_EXECUTOR.Enum(),
 		ExecutorID: &state.executor.ExecutorID,
-		UUID:       []byte(uuid.NewRandom()),
+		UUID:       uuid.NewRandom(),
 	}
 }
 
@@ -485,4 +329,55 @@ type internalState struct {
 	unackedUpdates map[string]executor.Call_Update
 	failedTasks    map[mesos.TaskID]mesos.TaskStatus // send updates for these as we can
 	shouldQuit     bool
+}
+
+func send(state *internalState, taskId mesos.TaskID, taskState *mesos.TaskState, mess *string, data []byte) {
+	status := newStatus(state, taskId)
+	status.State = taskState
+	status.Message = mess
+	status.Data = data
+	err := update(state, status)
+	if err != nil {
+		log.Printf("failed to send "+taskState.String()+" for task %s: %+v", taskId, err)
+		status.State = mesos.TASK_FAILED.Enum()
+		status.Message = protoString(err.Error())
+		state.failedTasks[taskId] = status
+	}
+}
+
+func launch(cfg config.Config, state *internalState, task mesos.TaskInfo) {
+	state.unackedTasks[task.TaskID] = task
+
+	b, _ := json.Marshal(task)
+	log.Println(string(b))
+
+	send(state, task.TaskID, mesos.TASK_STARTING.Enum(), tools.StringPtr(""), nil)
+
+	exitCall := func(taskState *mesos.TaskState, mess *string) {
+
+		send(state, task.TaskID, taskState, mess, nil)
+
+		log.Println("state.shouldQuit = true")
+		state.shouldQuit = true
+	}
+
+	err := docker_executor.DockerRun(cfg, task, ContainerName, exitCall)
+	if err != nil {
+		// todo
+		fmt.Println(err)
+		return
+	}
+
+	// time.Sleep(2 * time.Second)
+
+	inspectByte := docker_executor.DockerInspect(ContainerName)
+
+	send(state, task.TaskID, mesos.TASK_RUNNING.Enum(), tools.StringPtr(""), inspectByte)
+}
+
+func kill(state *internalState, taskId mesos.TaskID) {
+
+	send(state, taskId, mesos.TASK_KILLING.Enum(), tools.StringPtr(""), nil)
+
+	docker_executor.DockerKill(ContainerName)
 }
